@@ -42,8 +42,14 @@ def build_vision_augmentations(cfg: Dict[str, float | bool]) -> Callable[[torch.
                 hue=min(0.5, jitter_strength / 2),
             )
         )
-    if cfg.get("blur", 0.0) > 0:
-        transforms.append(T.RandomApply([T.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))], p=cfg["blur"]))
+    p_blur = float(cfg.get("blur", 0.0))
+    if p_blur > 0:
+        transforms.append(
+            T.RandomApply(
+                [T.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))],
+                p=p_blur,
+            )
+        )
 
     transforms.extend([T.ToTensor()])
     return T.Compose(transforms)

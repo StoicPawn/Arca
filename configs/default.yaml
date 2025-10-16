@@ -11,10 +11,18 @@ data:
     audio: 128
   num_workers: 8
   checksum:
-    STL10: 0b4980cc0d2fb013bf7c5c1b5d9ffcc1
-    DTD: d3de58c7a1ee74d2b8baea675985d8d5
-    ESC50: 1f5c635ed1b5f0ebce1d5241c8fada5b
-    UrbanSound8K: 9aa8f8e02f7d1d3fb61abec6cf0eed51
+    STL10:
+      algorithm: sha256
+      value: 9d2c8e4def1c53199c311b0a4b7596f1f96365e6a85ee844eb5d286276f4e5a4
+    DTD:
+      algorithm: sha256
+      value: 022464c3c92810dfc582f5ea18284d888fffbe671c5f3cf1911091cf07bba468
+    ESC50:
+      algorithm: sha256
+      value: 5b1fd19ea167d4c6857dc00c8388d65c95a6a7213dd5dc408dc325a71cbbdb9d
+    UrbanSound8K:
+      algorithm: sha256
+      value: 0a12f2af661ed0fdd3be4d6f90e1a5da760c01dd1bac06b9d3170f12e8df0e0b
 model:
   d: 512
   trainer: vicreg
