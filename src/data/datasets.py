@@ -159,7 +159,7 @@ def _verify_downloaded_dataset(
     raise RuntimeError(f"Checksum verification failed for {dataset_name} dataset.")
 
 
-def _load_torchvision_dataset(
+def _load_torch_dataset(
     dataset_cls,
     dataset_name: str,
     paths: DatasetPaths,
@@ -167,7 +167,7 @@ def _load_torchvision_dataset(
     archive_patterns: List[str],
     **kwargs: Any,
 ):
-    """Load a torchvision dataset while reusing previously downloaded files."""
+    """Load a torch dataset (vision or audio) while reusing cached files."""
 
     needs_download = False
 
@@ -220,7 +220,7 @@ def _prepare_stl10(
     dataset_cfg: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     del dataset_cfg  # Unused: retained for API parity
-    dataset = _load_torchvision_dataset(
+    dataset = _load_torch_dataset(
         tv_datasets.STL10,
         "STL10",
         paths,
@@ -243,13 +243,42 @@ def _prepare_stl10(
     return {"features": images}, metadata
 
 
+def _prepare_cifar10(
+    paths: DatasetPaths,
+    checksum_spec: Union[str, Mapping[str, str], None],
+    dataset_cfg: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    cfg = dict(dataset_cfg or {})
+    train_split = cfg.get("train", True)
+    dataset = _load_torch_dataset(
+        tv_datasets.CIFAR10,
+        "CIFAR10",
+        paths,
+        checksum_spec,
+        ["cifar-10-python.tar.gz", "cifar10*zip"],
+        train=train_split,
+    )
+
+    images = torch.from_numpy(dataset.data).permute(0, 3, 1, 2).float() / 255.0
+    labels = torch.tensor(dataset.targets, dtype=torch.long)
+
+    metadata: Dict[str, Any] = {
+        "split": "train" if train_split else "test",
+        "labels_available": True,
+        "num_samples": images.shape[0],
+        "label_names": list(getattr(dataset, "classes", [])),
+    }
+
+    return {"features": images, "labels": labels}, metadata
+
+
 def _prepare_dtd(
     paths: DatasetPaths,
     checksum_spec: Union[str, Mapping[str, str], None],
     dataset_cfg: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     del dataset_cfg  # Unused: retained for API parity
-    dataset = _load_torchvision_dataset(
+    dataset = _load_torch_dataset(
         tv_datasets.DTD,
         "DTD",
         paths,
@@ -278,6 +307,7 @@ def _prepare_dtd(
 
 
 VISION_DATASETS = {
+    "CIFAR10": _prepare_cifar10,
     "STL10": _prepare_stl10,
     "DTD": _prepare_dtd,
 }
@@ -563,9 +593,66 @@ def _prepare_esc50(
     return _prepare_hf_audio_dataset(paths, "ESC50", cfg)
 
 
+def _prepare_yesno(
+    paths: DatasetPaths,
+    checksum_spec: Union[str, Mapping[str, str], None],
+    dataset_cfg: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    cfg = dict(dataset_cfg or {})
+    dataset_kwargs = {k: v for k, v in cfg.items() if k not in {"split"}}
+    dataset = _load_torch_dataset(
+        torchaudio.datasets.YESNO,
+        "YESNO",
+        paths,
+        checksum_spec,
+        ["yes_no*tar.gz", "yesno*tar.gz"],
+        **dataset_kwargs,
+    )
+
+    log_mels: List[torch.Tensor] = []
+    lengths: List[int] = []
+    label_tensors: List[torch.Tensor] = []
+
+    for waveform, sample_rate, labels in tqdm(dataset, desc="Processing YESNO", leave=False):
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+        log_mel = _compute_log_mel(waveform, int(sample_rate)).squeeze(0)
+        log_mels.append(log_mel)
+        lengths.append(log_mel.size(-1))
+        if labels is not None:
+            label_tensors.append(torch.tensor(labels, dtype=torch.long))
+
+    if not log_mels:
+        raise RuntimeError("No audio samples found in YESNO dataset.")
+
+    n_mels = log_mels[0].size(0)
+    max_length = max(lengths)
+    features = torch.zeros((len(log_mels), n_mels, max_length), dtype=torch.float32)
+    for idx, (log_mel, length) in enumerate(zip(log_mels, lengths)):
+        features[idx, :, :length] = log_mel
+
+    payload: Dict[str, torch.Tensor] = {
+        "features": features,
+        "lengths": torch.tensor(lengths, dtype=torch.long),
+    }
+
+    metadata: Dict[str, Any] = {
+        "split": cfg.get("split", "unspecified"),
+        "labels_available": bool(label_tensors),
+        "num_samples": len(log_mels),
+        "source_url": getattr(dataset, "url", None),
+    }
+
+    if label_tensors:
+        payload["labels"] = torch.stack(label_tensors)
+
+    return payload, metadata
+
+
 AUDIO_DATASETS = {
     "UrbanSound8K": _prepare_urbansound8k,
     "ESC50": _prepare_esc50,
+    "YESNO": _prepare_yesno,
 }
 
 
@@ -702,6 +789,44 @@ def _build_dataloader(
 
 
 # ---------------------------------------------------------------------------
+# Configuration helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_dataset_spec(
+    cfg: Config,
+    modality: Literal["vision", "audio"],
+    default_name: str,
+) -> Tuple[str, Union[str, Mapping[str, str], None], Mapping[str, Any]]:
+    data_cfg = cfg.data or {}
+    datasets_cfg = data_cfg.get("datasets")
+
+    name = default_name
+    checksum_spec: Union[str, Mapping[str, str], None] = ""
+    options: Mapping[str, Any] = {}
+
+    if isinstance(datasets_cfg, Mapping):
+        entry = datasets_cfg.get(modality)
+        if entry is not None:
+            if isinstance(entry, str):
+                name = entry
+            else:
+                name = entry.get("name", name)
+                checksum_spec = entry.get("checksum", checksum_spec)
+                options = entry.get("options", options)
+
+    legacy_key = f"{modality}_dataset"
+    if legacy_key in data_cfg:
+        name = data_cfg[legacy_key]
+
+    checksum_spec = checksum_spec or data_cfg.get("checksum", {}).get(name, "")
+    if not options:
+        options = data_cfg.get("dataset_options", {}).get(name, {})
+
+    return name, checksum_spec, dict(options or {})
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -714,14 +839,16 @@ def prepare_datasets(cfg: Config) -> Dict[str, Dict[str, DataLoader]]:
     modalities = cfg.modalities or {"vision": True, "audio": True}
 
     if modalities.get("vision", False):
-        dataset_name = cfg.data.get("vision_dataset", "STL10")
+        dataset_name, checksum_spec, dataset_options = _resolve_dataset_spec(
+            cfg, "vision", "CIFAR10"
+        )
         preprocess_fn = VISION_DATASETS.get(dataset_name)
         if preprocess_fn is None:
             raise ValueError(f"Unsupported vision dataset '{dataset_name}'.")
         payload, metadata = preprocess_fn(
             base_path,
-            cfg.data.get("checksum", {}).get(dataset_name, ""),
-            cfg.data.get("dataset_options", {}).get(dataset_name, {}),
+            checksum_spec,
+            dataset_options,
         )
         if metadata:
             _save_metadata(metadata, "vision", dataset_name, base_path)
@@ -748,14 +875,16 @@ def prepare_datasets(cfg: Config) -> Dict[str, Dict[str, DataLoader]]:
         }
 
     if modalities.get("audio", False):
-        dataset_name = cfg.data.get("audio_dataset", "UrbanSound8K")
+        dataset_name, checksum_spec, dataset_options = _resolve_dataset_spec(
+            cfg, "audio", "YESNO"
+        )
         preprocess_fn = AUDIO_DATASETS.get(dataset_name)
         if preprocess_fn is None:
             raise ValueError(f"Unsupported audio dataset '{dataset_name}'.")
         payload, metadata = preprocess_fn(
             base_path,
-            cfg.data.get("checksum", {}).get(dataset_name, ""),
-            cfg.data.get("dataset_options", {}).get(dataset_name, {}),
+            checksum_spec,
+            dataset_options,
         )
         if metadata:
             _save_metadata(metadata, "audio", dataset_name, base_path)
