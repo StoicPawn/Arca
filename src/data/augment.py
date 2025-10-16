@@ -22,7 +22,12 @@ class AudioAugmentConfig:
     noise: float = 0.0
 
 
-def build_vision_augment(config: VisionAugmentConfig) -> Callable[[torch.Tensor], torch.Tensor]:
+def build_vision_augment(
+    config: VisionAugmentConfig,
+    *,
+    mean: tuple[float, float, float] | None = None,
+    std: tuple[float, float, float] | None = None,
+) -> Callable[[torch.Tensor], torch.Tensor]:
     transforms = [T.RandomResizedCrop(size=96, scale=(config.crop, 1.0))]
     if config.flip:
         transforms.append(T.RandomHorizontalFlip())
@@ -37,7 +42,11 @@ def build_vision_augment(config: VisionAugmentConfig) -> Callable[[torch.Tensor]
         )
     if config.blur > 0:
         transforms.append(T.GaussianBlur(kernel_size=3, sigma=(0.1, config.blur)))
-    transforms.append(T.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)))
+    if mean is None:
+        mean = (0.5, 0.5, 0.5)
+    if std is None:
+        std = (0.5, 0.5, 0.5)
+    transforms.append(T.Normalize(mean=mean, std=std))
     return T.Compose(transforms)
 
 
