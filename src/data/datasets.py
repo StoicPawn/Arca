@@ -6,10 +6,12 @@ import json
 import numbers
 import shutil
 import warnings
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -356,6 +358,70 @@ def _ensure_torchaudio_backend() -> None:
     )
 
 
+def _load_waveform_without_torchaudio(file_audio: Union[str, Path]) -> Tuple[torch.Tensor, int]:
+    """Load a waveform using the standard library as a TorchCodec-free fallback."""
+
+    with wave.open(str(file_audio), "rb") as handle:
+        num_channels = handle.getnchannels()
+        sample_rate = handle.getframerate()
+        sample_width = handle.getsampwidth()
+        num_frames = handle.getnframes()
+        audio_bytes = handle.readframes(num_frames)
+
+    dtype_map = {1: np.uint8, 2: np.int16, 4: np.int32}
+    if sample_width not in dtype_map:
+        raise RuntimeError(
+            f"Unsupported sample width {sample_width} bytes in '{file_audio}'."
+        )
+
+    dtype = dtype_map[sample_width]
+    waveform = np.frombuffer(audio_bytes, dtype=dtype)
+    if num_channels > 1:
+        waveform = waveform.reshape(-1, num_channels).T
+    else:
+        waveform = waveform.reshape(1, -1)
+
+    if sample_width == 1:
+        waveform = (waveform.astype(np.float32) - 128.0) / 128.0
+    else:
+        scale = float(2 ** (8 * sample_width - 1))
+        waveform = waveform.astype(np.float32) / scale
+
+    return torch.from_numpy(waveform), sample_rate
+
+
+def _load_yesno_samples(dataset: torchaudio.datasets.YESNO) -> List[Tuple[torch.Tensor, int, List[int]]]:
+    """Load YESNO samples, falling back to pure Python decoding if necessary."""
+
+    samples: List[Tuple[torch.Tensor, int, List[int]]] = []
+
+    try:
+        for idx in range(len(dataset)):
+            samples.append(dataset[idx])
+        return samples
+    except RuntimeError as exc:
+        if "libtorchcodec" not in str(exc):
+            raise
+
+    warnings.warn(
+        (
+            "TorchCodec could not be loaded; falling back to Python's 'wave' module "
+            "for decoding YESNO audio files. Audio loading will be slower but should "
+            "remain functional."
+        ),
+        RuntimeWarning,
+    )
+
+    base_path = Path(dataset._path)  # noqa: SLF001 - accessing private attribute for fallback
+    for fileid in dataset._walker:  # noqa: SLF001
+        file_audio = base_path / f"{fileid}.wav"
+        waveform, sample_rate = _load_waveform_without_torchaudio(file_audio)
+        labels = [int(char) for char in fileid.split("_")]
+        samples.append((waveform, sample_rate, labels))
+
+    return samples
+
+
 def _compute_log_mel(
     waveform: torch.Tensor,
     sample_rate: int,
@@ -651,11 +717,13 @@ def _prepare_yesno(
         **dataset_kwargs,
     )
 
+    samples = _load_yesno_samples(dataset)
+
     log_mels: List[torch.Tensor] = []
     lengths: List[int] = []
     label_tensors: List[torch.Tensor] = []
 
-    for waveform, sample_rate, labels in tqdm(dataset, desc="Processing YESNO", leave=False):
+    for waveform, sample_rate, labels in tqdm(samples, desc="Processing YESNO", leave=False):
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
         log_mel = _compute_log_mel(waveform, int(sample_rate)).squeeze(0)
