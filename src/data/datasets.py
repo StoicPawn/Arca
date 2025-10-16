@@ -22,7 +22,7 @@ import torchvision.transforms as T
 import torchaudio
 from torchaudio import transforms as ta_transforms
 
-from datasets import ClassLabel, load_dataset, load_from_disk
+from datasets import Audio, ClassLabel, DownloadMode, load_dataset, load_from_disk
 
 from src.utils.config import Config, load_from_args
 from src.utils.seed import set_seed
@@ -473,6 +473,7 @@ def _load_or_download_hf_dataset(
             split=split,
             cache_dir=str(cache_dir),
             revision=revision,
+            download_mode=DownloadMode.REUSE_DATASET_IF_EXISTS,
         )
         dataset.save_to_disk(str(dataset_disk_path))
 
@@ -495,6 +496,10 @@ def _prepare_hf_audio_dataset(
     config_name = dataset_cfg.get("config") or dataset_cfg.get("config_name")
     split = dataset_cfg.get("split", "train")
     revision = dataset_cfg.get("revision")
+    if not revision:
+        raise ValueError(
+            f"Hugging Face dataset configuration for {dataset_name} must include a 'revision'."
+        )
     cache_subdir = dataset_cfg.get("cache_subdir")
     audio_column = dataset_cfg.get("audio_column", "audio")
     label_column = dataset_cfg.get("label_column")
@@ -512,6 +517,18 @@ def _prepare_hf_audio_dataset(
         revision=revision,
         cache_subdir=cache_subdir,
     )
+
+    audio_feature = dataset.features.get(audio_column)
+    if not isinstance(audio_feature, Audio):
+        raise TypeError(
+            f"Column '{audio_column}' in Hugging Face dataset for {dataset_name} is not an Audio feature."
+        )
+
+    audio_cast_kwargs: Dict[str, Any] = {"sampling_rate": audio_feature.sampling_rate, "decode": False}
+    if hasattr(audio_feature, "mono"):
+        audio_cast_kwargs["mono"] = audio_feature.mono
+
+    dataset = dataset.cast_column(audio_column, Audio(**audio_cast_kwargs))
 
     fingerprint = dataset._fingerprint
     if expected_fingerprint and fingerprint != expected_fingerprint:
@@ -549,13 +566,13 @@ def _prepare_hf_audio_dataset(
             )
 
         audio_sample = sample[audio_column]
-        waveform = torch.tensor(audio_sample["array"], dtype=torch.float32)
-        if waveform.dim() == 1:
-            waveform = waveform.unsqueeze(0)
-        elif waveform.dim() == 2:
-            waveform = waveform.transpose(0, 1)
+        audio_path = audio_sample.get("path")
+        if not audio_path:
+            raise RuntimeError(
+                f"Decoded sample for {dataset_name} is missing an audio path in column '{audio_column}'."
+            )
 
-        sample_rate = int(audio_sample["sampling_rate"])
+        waveform, sample_rate = _load_waveform_without_torchaudio(audio_path)
         log_mel = _compute_log_mel(waveform, sample_rate).squeeze(0)
 
         time_steps = log_mel.size(-1)
@@ -581,13 +598,13 @@ def _prepare_hf_audio_dataset(
     ):
         sample = dataset[idx]
         audio_sample = sample[audio_column]
-        waveform = torch.tensor(audio_sample["array"], dtype=torch.float32)
-        if waveform.dim() == 1:
-            waveform = waveform.unsqueeze(0)
-        elif waveform.dim() == 2:
-            waveform = waveform.transpose(0, 1)
+        audio_path = audio_sample.get("path")
+        if not audio_path:
+            raise RuntimeError(
+                f"Decoded sample for {dataset_name} is missing an audio path in column '{audio_column}'."
+            )
 
-        sample_rate = int(audio_sample["sampling_rate"])
+        waveform, sample_rate = _load_waveform_without_torchaudio(audio_path)
         log_mel = _compute_log_mel(waveform, sample_rate).squeeze(0)
 
         time_steps = log_mel.size(-1)
