@@ -49,8 +49,16 @@ AUDIO_DATASETS: Dict[str, type] = {
 def _initialise_audio_backend() -> None:
     """Select an audio backend compatible with the current environment."""
 
+    get_backend = getattr(torchaudio, "get_audio_backend", None)
+
+    if get_backend is None:
+        LOGGER.debug(
+            "torchaudio.get_audio_backend is unavailable; skipping backend initialisation."
+        )
+        return
+
     try:
-        current = torchaudio.get_audio_backend()
+        current = get_backend()
     except RuntimeError:
         current = None
 
@@ -60,16 +68,32 @@ def _initialise_audio_backend() -> None:
         return
 
     available = []
-    try:
-        available = torchaudio.list_audio_backends()
-    except RuntimeError:
-        LOGGER.warning("Could not list torchaudio backends; relying on default backend.")
-        return
+    list_backends = getattr(torchaudio, "list_audio_backends", None)
+    if list_backends is None:
+        LOGGER.debug(
+            "torchaudio.list_audio_backends is unavailable; relying on default backend."
+        )
+    else:
+        try:
+            available = list_backends()
+        except RuntimeError:
+            LOGGER.warning(
+                "Could not list torchaudio backends; relying on default backend."
+            )
+            return
 
     for backend in preferred_backends:
         if backend in available:
+            set_backend = getattr(torchaudio, "set_audio_backend", None)
+            if set_backend is None:
+                LOGGER.debug(
+                    "torchaudio.set_audio_backend is unavailable; cannot select backend '%s'",
+                    backend,
+                )
+                continue
+
             try:
-                torchaudio.set_audio_backend(backend)
+                set_backend(backend)
             except RuntimeError:
                 LOGGER.debug("Failed to set torchaudio backend '%s'", backend, exc_info=True)
                 continue
