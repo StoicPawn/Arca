@@ -1,0 +1,10 @@
+numpy
+scipy
+pandas
+torch
+torchvision
+torchaudio
+pyyaml
+tqdm
+librosa
+soundfile
