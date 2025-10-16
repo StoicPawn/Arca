@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import numbers
+import shutil
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -158,6 +159,56 @@ def _verify_downloaded_dataset(
     raise RuntimeError(f"Checksum verification failed for {dataset_name} dataset.")
 
 
+def _load_torchvision_dataset(
+    dataset_cls,
+    dataset_name: str,
+    paths: DatasetPaths,
+    checksum_spec: Union[str, Mapping[str, str], None],
+    archive_patterns: List[str],
+    **kwargs: Any,
+):
+    """Load a torchvision dataset while reusing previously downloaded files."""
+
+    needs_download = False
+
+    try:
+        dataset = dataset_cls(root=str(paths.raw), download=False, **kwargs)
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if "download=true" not in message:
+            raise
+        needs_download = True
+    else:
+        try:
+            _verify_downloaded_dataset(
+                dataset_name, dataset, paths, checksum_spec, archive_patterns
+            )
+            return dataset
+        except RuntimeError as verify_error:
+            warnings.warn(
+                (
+                    f"Existing {dataset_name} files failed verification and will be "
+                    f"downloaded again: {verify_error}"
+                ),
+                RuntimeWarning,
+            )
+            base_folder = getattr(dataset, "base_folder", None)
+            root_path = Path(getattr(dataset, "root", paths.raw))
+            target_path = root_path / base_folder if base_folder else root_path
+            if target_path.exists():
+                shutil.rmtree(target_path, ignore_errors=True)
+            needs_download = True
+
+    if not needs_download:
+        raise RuntimeError(
+            f"Failed to load torchvision dataset {dataset_name} without downloading."
+        )
+
+    dataset = dataset_cls(root=str(paths.raw), download=True, **kwargs)
+    _verify_downloaded_dataset(dataset_name, dataset, paths, checksum_spec, archive_patterns)
+    return dataset
+
+
 # ---------------------------------------------------------------------------
 # Vision preprocessing
 # ---------------------------------------------------------------------------
@@ -169,18 +220,17 @@ def _prepare_stl10(
     dataset_cfg: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     del dataset_cfg  # Unused: retained for API parity
-    dataset = tv_datasets.STL10(
-        root=str(paths.raw),
+    dataset = _load_torchvision_dataset(
+        tv_datasets.STL10,
+        "STL10",
+        paths,
+        checksum_spec,
+        ["stl10*tar.gz", "stl10*zip"],
         split="unlabeled",
-        download=True,
     )
 
     # STL10 ships with 96x96x3 numpy arrays
     images = torch.from_numpy(dataset.data).permute(0, 3, 1, 2).float() / 255.0
-
-    _verify_downloaded_dataset(
-        "STL10", dataset, paths, checksum_spec, ["stl10*tar.gz", "stl10*zip"]
-    )
 
     metadata: Dict[str, Any] = {
         "split": "unlabeled",
@@ -199,9 +249,13 @@ def _prepare_dtd(
     dataset_cfg: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     del dataset_cfg  # Unused: retained for API parity
-    dataset = tv_datasets.DTD(root=str(paths.raw), split="train", download=True)
-    _verify_downloaded_dataset(
-        "DTD", dataset, paths, checksum_spec, ["dtd*tar.gz", "dtd*zip"]
+    dataset = _load_torchvision_dataset(
+        tv_datasets.DTD,
+        "DTD",
+        paths,
+        checksum_spec,
+        ["dtd*tar.gz", "dtd*zip"],
+        split="train",
     )
 
     resize = T.Resize((96, 96))
@@ -343,11 +397,17 @@ def _prepare_hf_audio_dataset(
             RuntimeWarning,
         )
 
-    specs: List[torch.Tensor] = []
-    lengths: List[int] = []
+    dataset_length = len(dataset)
+    lengths_tensor = torch.empty(dataset_length, dtype=torch.long)
     raw_labels: List[Any] = []
 
-    for sample in tqdm(dataset, desc=f"Processing {dataset_name}", leave=False):
+    max_length = 0
+    n_mels: Optional[int] = None
+
+    for idx in tqdm(
+        range(dataset_length), desc=f"Scanning {dataset_name}", leave=False
+    ):
+        sample = dataset[idx]
         if audio_column not in sample:
             raise KeyError(
                 f"Column '{audio_column}' not found in Hugging Face dataset for {dataset_name}."
@@ -361,9 +421,13 @@ def _prepare_hf_audio_dataset(
             waveform = waveform.transpose(0, 1)
 
         sample_rate = int(audio_sample["sampling_rate"])
-        log_mel = _compute_log_mel(waveform, sample_rate)
-        specs.append(log_mel)
-        lengths.append(log_mel.size(-1))
+        log_mel = _compute_log_mel(waveform, sample_rate).squeeze(0)
+
+        time_steps = log_mel.size(-1)
+        lengths_tensor[idx] = time_steps
+        max_length = max(max_length, time_steps)
+        if n_mels is None:
+            n_mels = log_mel.size(0)
 
         if label_column is not None:
             if label_column not in sample:
@@ -372,14 +436,31 @@ def _prepare_hf_audio_dataset(
                 )
             raw_labels.append(sample[label_column])
 
-    padded = torch.nn.utils.rnn.pad_sequence(
-        [spec.squeeze(0).transpose(0, 1) for spec in specs],
-        batch_first=True,
-    ).permute(0, 2, 1)
+    if n_mels is None:
+        raise RuntimeError(f"No audio samples found in Hugging Face dataset {dataset_name}.")
+
+    features = torch.zeros((dataset_length, n_mels, max_length), dtype=torch.float32)
+
+    for idx in tqdm(
+        range(dataset_length), desc=f"Materializing {dataset_name}", leave=False
+    ):
+        sample = dataset[idx]
+        audio_sample = sample[audio_column]
+        waveform = torch.tensor(audio_sample["array"], dtype=torch.float32)
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+        elif waveform.dim() == 2:
+            waveform = waveform.transpose(0, 1)
+
+        sample_rate = int(audio_sample["sampling_rate"])
+        log_mel = _compute_log_mel(waveform, sample_rate).squeeze(0)
+
+        time_steps = log_mel.size(-1)
+        features[idx, :, :time_steps] = log_mel
 
     payload: Dict[str, torch.Tensor] = {
-        "features": padded,
-        "lengths": torch.tensor(lengths, dtype=torch.long),
+        "features": features,
+        "lengths": lengths_tensor,
     }
 
     label_names: Optional[List[str]] = None
