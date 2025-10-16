@@ -5,7 +5,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Literal, Tuple
+from typing import Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -45,21 +45,66 @@ class DatasetPaths:
 # ---------------------------------------------------------------------------
 
 
-def _md5(path: Path) -> str:
-    hash_md5 = hashlib.md5()
+def _compute_digest(path: Path, algorithm: str) -> str:
+    """Compute the checksum for ``path`` using ``algorithm``."""
+
+    try:
+        hasher = hashlib.new(algorithm)
+    except ValueError as exc:  # pragma: no cover - defensive
+        raise ValueError(f"Unsupported checksum algorithm '{algorithm}'.") from exc
+
     with path.open("rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
-def verify_checksum(directory: Path, expected: str) -> bool:
-    """Verify that any file inside ``directory`` matches the expected md5 hash."""
+def _normalize_checksum_spec(
+    spec: Union[str, Mapping[str, str], None]
+) -> Tuple[str, str]:
+    """Normalize checksum configuration into ``(digest, algorithm)`` tuple.
 
-    for path in directory.rglob("*"):
-        if path.is_file() and _md5(path) == expected:
-            return True
-    return False
+    ``spec`` can either be a raw digest string (md5/sha256) or a mapping with
+    ``hash``/``value`` and ``algorithm`` fields. Empty or missing specs yield an
+    empty digest and default algorithm (sha256).
+    """
+
+    if spec is None:
+        return "", "sha256"
+
+    if isinstance(spec, str):
+        digest = spec.strip()
+        if not digest:
+            return "", "sha256"
+        length = len(digest)
+        if length == 32:
+            return digest, "md5"
+        if length == 64:
+            return digest, "sha256"
+        raise ValueError(
+            "Checksum string must be a 32-character MD5 or 64-character SHA256 digest."
+        )
+
+    algorithm = spec.get("algorithm", "sha256").lower()
+    digest = spec.get("value") or spec.get("hash") or ""
+    digest = digest.strip()
+    if not digest:
+        return "", algorithm
+    return digest, algorithm
+
+
+def verify_checksum_file(path: Path, expected: str, algorithm: str = "sha256") -> bool:
+    """Verify that ``path`` matches the expected checksum."""
+
+    return path.is_file() and _compute_digest(path, algorithm) == expected
+
+
+def _find_archive(base_path: Path, patterns: List[str]) -> Optional[Path]:
+    for pattern in patterns:
+        match = next(base_path.rglob(pattern), None)
+        if match is not None:
+            return match
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +112,9 @@ def verify_checksum(directory: Path, expected: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _prepare_stl10(paths: DatasetPaths, checksum: str) -> Dict[str, torch.Tensor]:
+def _prepare_stl10(
+    paths: DatasetPaths, checksum_spec: Union[str, Mapping[str, str], None]
+) -> Dict[str, torch.Tensor]:
     dataset = tv_datasets.STL10(
         root=str(paths.raw),
         split="unlabeled",
@@ -77,16 +124,24 @@ def _prepare_stl10(paths: DatasetPaths, checksum: str) -> Dict[str, torch.Tensor
     # STL10 ships with 96x96x3 numpy arrays
     images = torch.from_numpy(dataset.data).permute(0, 3, 1, 2).float() / 255.0
 
-    if checksum and not verify_checksum(paths.raw, checksum):
-        raise RuntimeError("Checksum verification failed for STL10 dataset.")
+    digest, algorithm = _normalize_checksum_spec(checksum_spec)
+    if digest:
+        archive = _find_archive(paths.raw, ["stl10*tar.gz", "stl10*zip"])
+        if archive is None or not verify_checksum_file(archive, digest, algorithm):
+            raise RuntimeError("Checksum verification failed for STL10 dataset.")
 
     return {"features": images}
 
 
-def _prepare_dtd(paths: DatasetPaths, checksum: str) -> Dict[str, torch.Tensor]:
+def _prepare_dtd(
+    paths: DatasetPaths, checksum_spec: Union[str, Mapping[str, str], None]
+) -> Dict[str, torch.Tensor]:
     dataset = tv_datasets.DTD(root=str(paths.raw), split="train", download=True)
-    if checksum and not verify_checksum(paths.raw, checksum):
-        raise RuntimeError("Checksum verification failed for DTD dataset.")
+    digest, algorithm = _normalize_checksum_spec(checksum_spec)
+    if digest:
+        archive = _find_archive(paths.raw, ["dtd*tar.gz", "dtd*zip"])
+        if archive is None or not verify_checksum_file(archive, digest, algorithm):
+            raise RuntimeError("Checksum verification failed for DTD dataset.")
 
     resize = T.Resize((96, 96))
     to_tensor = T.ToTensor()
@@ -132,13 +187,18 @@ def _compute_log_mel(
     return log_mel
 
 
-def _prepare_urbansound8k(paths: DatasetPaths, checksum: str) -> Dict[str, torch.Tensor]:
+def _prepare_urbansound8k(
+    paths: DatasetPaths, checksum_spec: Union[str, Mapping[str, str], None]
+) -> Dict[str, torch.Tensor]:
     dataset = torchaudio.datasets.URBANSOUND8K(
         root=str(paths.raw),
         download=True,
     )
-    if checksum and not verify_checksum(paths.raw, checksum):
-        raise RuntimeError("Checksum verification failed for UrbanSound8K dataset.")
+    digest, algorithm = _normalize_checksum_spec(checksum_spec)
+    if digest:
+        archive = _find_archive(paths.raw, ["UrbanSound8K*tar.gz", "UrbanSound8K*zip"])
+        if archive is None or not verify_checksum_file(archive, digest, algorithm):
+            raise RuntimeError("Checksum verification failed for UrbanSound8K dataset.")
 
     specs: List[torch.Tensor] = []
     lengths: List[int] = []
@@ -158,10 +218,15 @@ def _prepare_urbansound8k(paths: DatasetPaths, checksum: str) -> Dict[str, torch
     return {"features": padded, "lengths": torch.tensor(lengths, dtype=torch.long)}
 
 
-def _prepare_esc50(paths: DatasetPaths, checksum: str) -> Dict[str, torch.Tensor]:
+def _prepare_esc50(
+    paths: DatasetPaths, checksum_spec: Union[str, Mapping[str, str], None]
+) -> Dict[str, torch.Tensor]:
     dataset = torchaudio.datasets.ESC50(root=str(paths.raw), download=True)
-    if checksum and not verify_checksum(paths.raw, checksum):
-        raise RuntimeError("Checksum verification failed for ESC-50 dataset.")
+    digest, algorithm = _normalize_checksum_spec(checksum_spec)
+    if digest:
+        archive = _find_archive(paths.raw, ["ESC*zip", "ESC*tar.gz"])
+        if archive is None or not verify_checksum_file(archive, digest, algorithm):
+            raise RuntimeError("Checksum verification failed for ESC-50 dataset.")
 
     specs: List[torch.Tensor] = []
     lengths: List[int] = []
@@ -381,5 +446,5 @@ __all__ = [
     "VisionTensorDataset",
     "AudioTensorDataset",
     "prepare_datasets",
-    "verify_checksum",
+    "verify_checksum_file",
 ]
