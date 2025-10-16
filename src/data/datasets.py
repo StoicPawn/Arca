@@ -56,7 +56,7 @@ def _md5(path: Path) -> str:
 def verify_checksum(directory: Path, expected: str) -> bool:
     """Verify that any file inside ``directory`` matches the expected md5 hash."""
 
-    for path in directory.iterdir():
+    for path in directory.rglob("*"):
         if path.is_file() and _md5(path) == expected:
             return True
     return False
