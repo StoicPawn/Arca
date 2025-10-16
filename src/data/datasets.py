@@ -46,6 +46,72 @@ AUDIO_DATASETS: Dict[str, type] = {
 }
 
 
+def _initialise_audio_backend() -> None:
+    """Select an audio backend compatible with the current environment."""
+
+    try:
+        current = torchaudio.get_audio_backend()
+    except RuntimeError:
+        current = None
+
+    preferred_backends = ("soundfile", "sox_io")
+
+    if current in preferred_backends:
+        return
+
+    available = []
+    try:
+        available = torchaudio.list_audio_backends()
+    except RuntimeError:
+        LOGGER.warning("Could not list torchaudio backends; relying on default backend.")
+        return
+
+    for backend in preferred_backends:
+        if backend in available:
+            try:
+                torchaudio.set_audio_backend(backend)
+            except RuntimeError:
+                LOGGER.debug("Failed to set torchaudio backend '%s'", backend, exc_info=True)
+                continue
+            LOGGER.info("Using torchaudio backend '%s'", backend)
+            return
+
+    if current is None:
+        LOGGER.warning(
+            "No compatible torchaudio backend available; audio loading may rely on torchcodec."
+        )
+
+
+def _fallback_load_yesno(dataset: torchaudio.datasets.YESNO, idx: int, exc: RuntimeError):
+    """Fallback loader for YESNO dataset when torchcodec is unavailable."""
+
+    try:
+        import soundfile as sf
+    except ImportError as import_exc:  # pragma: no cover - dependency issue
+        raise exc from import_exc
+
+    fileid = dataset._walker[idx]
+    file_audio = pathlib.Path(dataset._path) / f"{fileid}.wav"
+
+    try:
+        audio, sample_rate = sf.read(file_audio, dtype="float32")
+    except RuntimeError as read_exc:  # pragma: no cover - propagate soundfile errors
+        raise exc from read_exc
+
+    if audio.ndim == 1:
+        waveform = torch.from_numpy(audio).unsqueeze(0)
+    else:
+        waveform = torch.from_numpy(audio).transpose(0, 1)
+
+    labels = [int(c) for c in fileid.split("_")]
+    LOGGER.warning(
+        "Falling back to soundfile backend for '%s' due to torchcodec error: %s",
+        file_audio,
+        exc,
+    )
+    return waveform, int(sample_rate), labels
+
+
 def ensure_dirs(config: Config) -> Tuple[pathlib.Path, pathlib.Path]:
     data_root = config.data_root
     raw_dir = data_root / "raw"
@@ -190,6 +256,7 @@ def process_audio_dataset(
     dataset_dir.mkdir(parents=True, exist_ok=True)
 
     opts, limit = _extract_limit(options)
+    _initialise_audio_backend()
     try:
         dataset = dataset_class(root=str(dataset_dir), download=True, **opts)
     except (urllib.error.URLError, RuntimeError) as exc:
@@ -199,7 +266,10 @@ def process_audio_dataset(
 
     features: List[np.ndarray] = []
     for idx in tqdm(range(len(dataset)), desc=f"Processing {name}"):
-        waveform, sample_rate, *_ = dataset[idx]
+        try:
+            waveform, sample_rate, *_ = dataset[idx]
+        except RuntimeError as exc:
+            waveform, sample_rate, *_ = _fallback_load_yesno(dataset, idx, exc)
         waveform = _to_mono(waveform)
         waveform = _resample_waveform(waveform, sample_rate)
         audio = waveform.numpy()
