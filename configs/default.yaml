@@ -4,16 +4,21 @@ modalities:
   audio: true
 data:
   root: ./data
-  vision_dataset: STL10
-  audio_dataset: UrbanSound8K
+  datasets:
+    vision:
+      name: CIFAR10
+      checksum: null
+      options:
+        train: true
+    audio:
+      name: YESNO
+      checksum: null
+      options: {}
   batch_size:
     vision: 256
     audio: 128
   num_workers: 8
   checksum:
-    STL10:
-      algorithm: sha256
-      value: 9d2c8e4def1c53199c311b0a4b7596f1f96365e6a85ee844eb5d286276f4e5a4
     DTD:
       algorithm: sha256
       value: 022464c3c92810dfc582f5ea18284d888fffbe671c5f3cf1911091cf07bba468

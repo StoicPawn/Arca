@@ -52,7 +52,7 @@ project/
 🧩 Descrizione moduli
 datasets.py
 
-Scarica dataset pubblici (STL-10 unlabeled, DTD, ESC-50, UrbanSound8K).
+Scarica dataset pubblici (CIFAR-10, STL-10 unlabeled, DTD, ESC-50, UrbanSound8K, YESNO).
 
 Verifica checksum e decomprime.
 
@@ -127,8 +127,9 @@ seed: 42
 modalities: { vision: true, audio: true }
 data:
   root: ./data
-  vision_dataset: STL10
-  audio_dataset: UrbanSound8K
+  datasets:
+    vision: { name: CIFAR10, checksum: null, options: { train: true } }
+    audio:  { name: YESNO, checksum: null, options: {} }
   batch_size: { vision: 256, audio: 128 }
   num_workers: 8
 model:
