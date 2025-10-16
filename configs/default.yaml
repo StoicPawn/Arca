@@ -11,9 +11,10 @@ data:
       options:
         train: true
     audio:
-      name: YESNO
+      name: UrbanSound8K
       checksum: null
-      options: {}
+      options:
+        split: train[:2000]
   batch_size:
     vision: 256
     audio: 128

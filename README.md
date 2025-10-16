@@ -53,6 +53,8 @@ project/
 datasets.py
 
 Scarica dataset pubblici (CIFAR-10, STL-10 unlabeled, DTD, ESC-50, UrbanSound8K, YESNO).
+Per l'audio la configurazione di default usa UrbanSound8K con uno slicing ``train[:2000]``
+per mantenere un compromesso tra varietà di classi e dimensione su disco.
 
 Verifica checksum e decomprime.
 
@@ -129,7 +131,7 @@ data:
   root: ./data
   datasets:
     vision: { name: CIFAR10, checksum: null, options: { train: true } }
-    audio:  { name: YESNO, checksum: null, options: {} }
+    audio:  { name: UrbanSound8K, checksum: null, options: { split: "train[:2000]" } }
   batch_size: { vision: 256, audio: 128 }
   num_workers: 8
 model:
