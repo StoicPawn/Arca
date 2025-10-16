@@ -1,0 +1,46 @@
+seed: 42
+modalities:
+  vision: true
+  audio: true
+data:
+  root: ./data
+  datasets:
+    vision:
+      name: CIFAR10
+      options:
+        train: true
+        limit: 2048
+    audio:
+      name: YESNO
+      options:
+        limit: 128
+  batch_size:
+    vision: 256
+    audio: 128
+  num_workers: 4
+model:
+  d: 512
+  trainer: vicreg
+  epochs: 100
+  lr: 0.001
+  weight_decay: 0.05
+  temperature: 0.1
+  augment:
+    vision:
+      crop: 0.8
+      flip: true
+      color_jitter: 0.2
+      blur: 0.3
+    audio:
+      time_shift: 0.2
+      mask_time: 0.1
+      noise: 0.01
+eval:
+  every_n_epochs: 10
+  metrics:
+    - nn_consistency
+    - uniformity
+    - oos_shift
+logging:
+  output_dir: ./artifacts
+  use_wandb: false
