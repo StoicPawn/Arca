@@ -17,12 +17,21 @@ data:
     DTD:
       algorithm: sha256
       value: 022464c3c92810dfc582f5ea18284d888fffbe671c5f3cf1911091cf07bba468
-    ESC50:
-      algorithm: sha256
-      value: 5b1fd19ea167d4c6857dc00c8388d65c95a6a7213dd5dc408dc325a71cbbdb9d
+  dataset_options:
     UrbanSound8K:
-      algorithm: sha256
-      value: 0a12f2af661ed0fdd3be4d6f90e1a5da760c01dd1bac06b9d3170f12e8df0e0b
+      repo_id: urbansound8k
+      split: train
+      revision: null
+      label_column: classID
+      audio_column: audio
+      label_name_column: class
+    ESC50:
+      repo_id: ashraq/esc50
+      split: train
+      revision: null
+      label_column: target
+      audio_column: audio
+      label_name_column: category
 model:
   d: 512
   trainer: vicreg

@@ -4,6 +4,7 @@ pandas
 torch
 torchvision
 torchaudio
+datasets
 pyyaml
 tqdm
 librosa

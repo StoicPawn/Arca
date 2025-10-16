@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import numbers
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Literal, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -17,6 +18,8 @@ import torchvision.transforms as T
 
 import torchaudio
 from torchaudio import transforms as ta_transforms
+
+from datasets import ClassLabel, load_dataset, load_from_disk
 
 from src.utils.config import Config, load_from_args
 from src.utils.seed import set_seed
@@ -161,8 +164,11 @@ def _verify_downloaded_dataset(
 
 
 def _prepare_stl10(
-    paths: DatasetPaths, checksum_spec: Union[str, Mapping[str, str], None]
-) -> Dict[str, torch.Tensor]:
+    paths: DatasetPaths,
+    checksum_spec: Union[str, Mapping[str, str], None],
+    dataset_cfg: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    del dataset_cfg  # Unused: retained for API parity
     dataset = tv_datasets.STL10(
         root=str(paths.raw),
         split="unlabeled",
@@ -176,12 +182,23 @@ def _prepare_stl10(
         "STL10", dataset, paths, checksum_spec, ["stl10*tar.gz", "stl10*zip"]
     )
 
-    return {"features": images}
+    metadata: Dict[str, Any] = {
+        "split": "unlabeled",
+        "labels_available": False,
+        "num_samples": images.shape[0],
+    }
+    if hasattr(dataset, "classes"):
+        metadata["label_names"] = list(dataset.classes)
+
+    return {"features": images}, metadata
 
 
 def _prepare_dtd(
-    paths: DatasetPaths, checksum_spec: Union[str, Mapping[str, str], None]
-) -> Dict[str, torch.Tensor]:
+    paths: DatasetPaths,
+    checksum_spec: Union[str, Mapping[str, str], None],
+    dataset_cfg: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    del dataset_cfg  # Unused: retained for API parity
     dataset = tv_datasets.DTD(root=str(paths.raw), split="train", download=True)
     _verify_downloaded_dataset(
         "DTD", dataset, paths, checksum_spec, ["dtd*tar.gz", "dtd*zip"]
@@ -191,10 +208,19 @@ def _prepare_dtd(
     to_tensor = T.ToTensor()
 
     tensors = []
-    for img, _ in tqdm(dataset, desc="Processing DTD", leave=False):
+    labels: List[int] = []
+    for img, target in tqdm(dataset, desc="Processing DTD", leave=False):
         tensors.append(resize(img))
+        labels.append(int(target))
     data = torch.stack([to_tensor(x) for x in tensors])
-    return {"features": data}
+    payload: Dict[str, torch.Tensor] = {"features": data, "labels": torch.tensor(labels, dtype=torch.long)}
+    metadata: Dict[str, Any] = {
+        "split": "train",
+        "labels_available": True,
+        "num_samples": data.shape[0],
+        "label_names": list(getattr(dataset, "classes", [])),
+    }
+    return payload, metadata
 
 
 VISION_DATASETS = {
@@ -231,62 +257,229 @@ def _compute_log_mel(
     return log_mel
 
 
-def _prepare_urbansound8k(
-    paths: DatasetPaths, checksum_spec: Union[str, Mapping[str, str], None]
-) -> Dict[str, torch.Tensor]:
-    dataset = torchaudio.datasets.URBANSOUND8K(
-        root=str(paths.raw),
-        download=True,
+def _load_or_download_hf_dataset(
+    paths: DatasetPaths,
+    dataset_name: str,
+    *,
+    repo_id: str,
+    split: str,
+    config_name: Optional[str],
+    revision: Optional[str],
+    cache_subdir: Optional[str],
+):
+    hf_root = paths.raw / "huggingface"
+    dataset_root = hf_root / (cache_subdir or repo_id.replace("/", "_"))
+    dataset_root.mkdir(parents=True, exist_ok=True)
+
+    dataset_disk_path = dataset_root / "dataset"
+    cache_dir = dataset_root / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if dataset_disk_path.exists():
+        dataset = load_from_disk(str(dataset_disk_path))
+    else:
+        dataset = load_dataset(
+            repo_id,
+            name=config_name,
+            split=split,
+            cache_dir=str(cache_dir),
+            revision=revision,
+        )
+        dataset.save_to_disk(str(dataset_disk_path))
+
+    return dataset, dataset_root
+
+
+def _prepare_hf_audio_dataset(
+    paths: DatasetPaths,
+    dataset_name: str,
+    dataset_cfg: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    dataset_cfg = dict(dataset_cfg or {})
+
+    repo_id = dataset_cfg.get("repo_id")
+    if not repo_id:
+        raise ValueError(
+            f"Hugging Face dataset configuration for {dataset_name} must include a 'repo_id'."
+        )
+
+    config_name = dataset_cfg.get("config") or dataset_cfg.get("config_name")
+    split = dataset_cfg.get("split", "train")
+    revision = dataset_cfg.get("revision")
+    cache_subdir = dataset_cfg.get("cache_subdir")
+    audio_column = dataset_cfg.get("audio_column", "audio")
+    label_column = dataset_cfg.get("label_column")
+    label_name_column = dataset_cfg.get("label_name_column")
+    expected_fingerprint = dataset_cfg.get("fingerprint") or dataset_cfg.get(
+        "expected_fingerprint"
     )
-    _verify_downloaded_dataset(
-        "UrbanSound8K",
-        dataset,
+
+    dataset, dataset_root = _load_or_download_hf_dataset(
         paths,
-        checksum_spec,
-        ["UrbanSound8K*tar.gz", "UrbanSound8K*zip"],
+        dataset_name,
+        repo_id=repo_id,
+        split=split,
+        config_name=config_name,
+        revision=revision,
+        cache_subdir=cache_subdir,
     )
+
+    fingerprint = dataset._fingerprint
+    if expected_fingerprint and fingerprint != expected_fingerprint:
+        raise RuntimeError(
+            (
+                f"Loaded Hugging Face dataset for {dataset_name} with fingerprint {fingerprint}, "
+                f"which does not match the expected fingerprint {expected_fingerprint}."
+            )
+        )
+
+    if revision is None and expected_fingerprint is None:
+        warnings.warn(
+            (
+                f"No explicit revision or fingerprint configured for {dataset_name}. "
+                "The dataset fingerprint has been recorded in the metadata file to aid "
+                "future reproducibility."
+            ),
+            RuntimeWarning,
+        )
 
     specs: List[torch.Tensor] = []
     lengths: List[int] = []
-    for waveform, sample_rate, _, _, _, _, _ in tqdm(dataset, desc="Processing UrbanSound8K", leave=False):
+    raw_labels: List[Any] = []
+
+    for sample in tqdm(dataset, desc=f"Processing {dataset_name}", leave=False):
+        if audio_column not in sample:
+            raise KeyError(
+                f"Column '{audio_column}' not found in Hugging Face dataset for {dataset_name}."
+            )
+
+        audio_sample = sample[audio_column]
+        waveform = torch.tensor(audio_sample["array"], dtype=torch.float32)
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
+        elif waveform.dim() == 2:
+            waveform = waveform.transpose(0, 1)
+
+        sample_rate = int(audio_sample["sampling_rate"])
         log_mel = _compute_log_mel(waveform, sample_rate)
         specs.append(log_mel)
         lengths.append(log_mel.size(-1))
 
+        if label_column is not None:
+            if label_column not in sample:
+                raise KeyError(
+                    f"Column '{label_column}' not found in Hugging Face dataset for {dataset_name}."
+                )
+            raw_labels.append(sample[label_column])
+
     padded = torch.nn.utils.rnn.pad_sequence(
         [spec.squeeze(0).transpose(0, 1) for spec in specs],
         batch_first=True,
-    )
-    # Reorder dimensions to [B, F, T]
-    padded = padded.permute(0, 2, 1)
-    return {"features": padded, "lengths": torch.tensor(lengths, dtype=torch.long)}
+    ).permute(0, 2, 1)
+
+    payload: Dict[str, torch.Tensor] = {
+        "features": padded,
+        "lengths": torch.tensor(lengths, dtype=torch.long),
+    }
+
+    label_names: Optional[List[str]] = None
+    label_mapping: Optional[Dict[str, int]] = None
+    if label_column is not None:
+        feature_info = dataset.features.get(label_column)
+
+        if isinstance(feature_info, ClassLabel):
+            label_names = list(feature_info.names)
+            labels_tensor = torch.tensor([int(x) for x in raw_labels], dtype=torch.long)
+        else:
+            normalized: List[Any] = []
+            for value in raw_labels:
+                if isinstance(value, numbers.Integral):
+                    normalized.append(int(value))
+                else:
+                    normalized.append(str(value))
+
+            if all(isinstance(v, int) for v in normalized):
+                labels_tensor = torch.tensor(normalized, dtype=torch.long)
+            else:
+                existing_mapping = dataset_cfg.get("label_mapping")
+                if existing_mapping is not None:
+                    label_mapping = {str(k): int(v) for k, v in existing_mapping.items()}
+                else:
+                    label_mapping = {}
+                    for value in normalized:
+                        key = str(value)
+                        if key not in label_mapping:
+                            label_mapping[key] = len(label_mapping)
+
+                labels_tensor = torch.tensor(
+                    [label_mapping[str(v)] for v in normalized], dtype=torch.long
+                )
+
+        payload["labels"] = labels_tensor
+
+    metadata: Dict[str, Any] = {
+        "repo_id": repo_id,
+        "config_name": config_name,
+        "split": split,
+        "revision": revision,
+        "fingerprint": fingerprint,
+        "audio_column": audio_column,
+        "num_samples": len(dataset),
+        "cache_directory": str(dataset_root),
+        "labels_available": label_column is not None,
+    }
+
+    if label_column is not None:
+        metadata["label_column"] = label_column
+    if label_names is not None:
+        metadata["label_names"] = label_names
+    if label_mapping is not None:
+        metadata["label_mapping"] = label_mapping
+    if expected_fingerprint is not None:
+        metadata["expected_fingerprint"] = expected_fingerprint
+    if (
+        label_column is not None
+        and label_name_column
+        and label_name_column in dataset.column_names
+    ):
+        metadata["label_name_column"] = label_name_column
+        mapping: Dict[str, Any] = {}
+        for raw_label, label_name in zip(raw_labels, dataset[label_name_column]):
+            key = str(raw_label)
+            mapping.setdefault(key, label_name)
+        metadata["label_name_mapping"] = mapping
+
+    return payload, metadata
+
+
+def _prepare_urbansound8k(
+    paths: DatasetPaths,
+    checksum_spec: Union[str, Mapping[str, str], None],
+    dataset_cfg: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    del checksum_spec  # Unused: retained for API compatibility
+    cfg = dict(dataset_cfg or {})
+    cfg.setdefault("repo_id", "urbansound8k")
+    cfg.setdefault("split", "train")
+    cfg.setdefault("audio_column", "audio")
+    cfg.setdefault("label_column", "classID")
+    cfg.setdefault("label_name_column", "class")
+    return _prepare_hf_audio_dataset(paths, "UrbanSound8K", cfg)
 
 
 def _prepare_esc50(
-    paths: DatasetPaths, checksum_spec: Union[str, Mapping[str, str], None]
-) -> Dict[str, torch.Tensor]:
-    dataset = torchaudio.datasets.ESC50(root=str(paths.raw), download=True)
-    _verify_downloaded_dataset(
-        "ESC-50", dataset, paths, checksum_spec, ["ESC*zip", "ESC*tar.gz"]
-    )
-
-    specs: List[torch.Tensor] = []
-    lengths: List[int] = []
-    for waveform, sample_rate, _, _, _ in tqdm(dataset, desc="Processing ESC-50", leave=False):
-        if waveform.dim() == 1:
-            waveform = waveform.unsqueeze(0)
-        log_mel = _compute_log_mel(waveform, sample_rate)
-        specs.append(log_mel)
-        lengths.append(log_mel.size(-1))
-
-    padded = torch.nn.utils.rnn.pad_sequence(
-        [spec.squeeze(0).transpose(0, 1) for spec in specs],
-        batch_first=True,
-    )
-    padded = padded.permute(0, 2, 1)
-    return {"features": padded, "lengths": torch.tensor(lengths, dtype=torch.long)}
+    paths: DatasetPaths,
+    checksum_spec: Union[str, Mapping[str, str], None],
+    dataset_cfg: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    del checksum_spec  # Unused: retained for API compatibility
+    cfg = dict(dataset_cfg or {})
+    cfg.setdefault("repo_id", "ashraq/esc50")
+    cfg.setdefault("split", "train")
+    cfg.setdefault("audio_column", "audio")
+    cfg.setdefault("label_column", "target")
+    cfg.setdefault("label_name_column", "category")
+    return _prepare_hf_audio_dataset(paths, "ESC50", cfg)
 
 
 AUDIO_DATASETS = {
@@ -301,30 +494,43 @@ AUDIO_DATASETS = {
 
 
 class VisionTensorDataset(Dataset):
-    """Simple dataset wrapper for image tensors."""
+    """Simple dataset wrapper for image tensors and optional labels."""
 
-    def __init__(self, features: torch.Tensor):
+    def __init__(self, features: torch.Tensor, labels: Optional[torch.Tensor] = None):
         self.features = features
+        self.labels = labels
 
     def __len__(self) -> int:  # pragma: no cover - trivial
         return self.features.size(0)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        return {"image": self.features[idx]}
+        sample = {"image": self.features[idx]}
+        if self.labels is not None:
+            sample["label"] = self.labels[idx]
+        return sample
 
 
 class AudioTensorDataset(Dataset):
-    """Dataset wrapper for padded log-mel spectrograms."""
+    """Dataset wrapper for padded log-mel spectrograms with optional labels."""
 
-    def __init__(self, features: torch.Tensor, lengths: torch.Tensor):
+    def __init__(
+        self,
+        features: torch.Tensor,
+        lengths: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+    ):
         self.features = features
         self.lengths = lengths
+        self.labels = labels
 
     def __len__(self) -> int:  # pragma: no cover - trivial
         return self.features.size(0)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        return {"audio": self.features[idx], "length": self.lengths[idx]}
+        sample = {"audio": self.features[idx], "length": self.lengths[idx]}
+        if self.labels is not None:
+            sample["label"] = self.labels[idx]
+        return sample
 
 
 def _split_payload(
@@ -377,6 +583,20 @@ def _save_statistics(stats: Dict[str, List[float]], modality: str, dataset_name:
     return output_path
 
 
+def _save_metadata(
+    metadata: Mapping[str, Any],
+    modality: str,
+    dataset_name: str,
+    paths: DatasetPaths,
+) -> Optional[Path]:
+    if not metadata:
+        return None
+    output_path = paths.processed / f"{dataset_name.lower()}_{modality}_metadata.json"
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+    return output_path
+
+
 def _build_dataloader(
     payload: Dict[str, torch.Tensor],
     modality: Literal["vision", "audio"],
@@ -385,9 +605,15 @@ def _build_dataloader(
     shuffle: bool,
 ) -> DataLoader:
     if modality == "vision":
-        dataset: Dataset = VisionTensorDataset(payload["features"])
+        dataset = VisionTensorDataset(
+            payload["features"], payload.get("labels")
+        )
     elif modality == "audio":
-        dataset = AudioTensorDataset(payload["features"], payload["lengths"])
+        dataset = AudioTensorDataset(
+            payload["features"],
+            payload["lengths"],
+            payload.get("labels"),
+        )
     else:  # pragma: no cover - defensive
         raise ValueError(f"Unsupported modality '{modality}'.")
 
@@ -411,7 +637,13 @@ def prepare_datasets(cfg: Config) -> Dict[str, Dict[str, DataLoader]]:
         preprocess_fn = VISION_DATASETS.get(dataset_name)
         if preprocess_fn is None:
             raise ValueError(f"Unsupported vision dataset '{dataset_name}'.")
-        payload = preprocess_fn(base_path, cfg.data.get("checksum", {}).get(dataset_name, ""))
+        payload, metadata = preprocess_fn(
+            base_path,
+            cfg.data.get("checksum", {}).get(dataset_name, ""),
+            cfg.data.get("dataset_options", {}).get(dataset_name, {}),
+        )
+        if metadata:
+            _save_metadata(metadata, "vision", dataset_name, base_path)
         train_payload, val_payload = _split_payload(payload, split=0.05, seed=cfg.seed)
         stats = _compute_statistics(train_payload["features"])
         _save_statistics(stats, "vision", dataset_name, base_path)
@@ -439,7 +671,13 @@ def prepare_datasets(cfg: Config) -> Dict[str, Dict[str, DataLoader]]:
         preprocess_fn = AUDIO_DATASETS.get(dataset_name)
         if preprocess_fn is None:
             raise ValueError(f"Unsupported audio dataset '{dataset_name}'.")
-        payload = preprocess_fn(base_path, cfg.data.get("checksum", {}).get(dataset_name, ""))
+        payload, metadata = preprocess_fn(
+            base_path,
+            cfg.data.get("checksum", {}).get(dataset_name, ""),
+            cfg.data.get("dataset_options", {}).get(dataset_name, {}),
+        )
+        if metadata:
+            _save_metadata(metadata, "audio", dataset_name, base_path)
         train_payload, val_payload = _split_payload(payload, split=0.05, seed=cfg.seed)
         stats = _compute_statistics(train_payload["features"])
         _save_statistics(stats, "audio", dataset_name, base_path)
