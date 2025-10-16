@@ -317,6 +317,45 @@ VISION_DATASETS = {
 # Audio preprocessing
 # ---------------------------------------------------------------------------
 
+def _ensure_torchaudio_backend() -> None:
+    """Select a torchaudio backend that does not rely on TorchCodec."""
+
+    preferred_backends = ("soundfile", "sox_io")
+
+    get_backend = getattr(torchaudio, "get_audio_backend", None)
+    set_backend = getattr(torchaudio, "set_audio_backend", None)
+
+    if set_backend is None:
+        # Modern torchaudio versions might not expose backend selection.
+        return
+
+    current_backend: Optional[str] = None
+    if callable(get_backend):
+        try:
+            current_backend = get_backend()
+        except RuntimeError:
+            current_backend = None
+
+    if current_backend in preferred_backends:
+        return
+
+    for backend in preferred_backends:
+        try:
+            set_backend(backend)
+            return
+        except RuntimeError:
+            continue
+
+    warnings.warn(
+        (
+            "Falling back to torchaudio's default backend. "
+            "Install 'torchcodec' or ensure one of the optional backends "
+            "('soundfile' or 'sox_io') is available to avoid audio loading errors."
+        ),
+        RuntimeWarning,
+    )
+
+
 def _compute_log_mel(
     waveform: torch.Tensor,
     sample_rate: int,
@@ -600,6 +639,9 @@ def _prepare_yesno(
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     cfg = dict(dataset_cfg or {})
     dataset_kwargs = {k: v for k, v in cfg.items() if k not in {"split"}}
+
+    _ensure_torchaudio_backend()
+
     dataset = _load_torch_dataset(
         torchaudio.datasets.YESNO,
         "YESNO",
