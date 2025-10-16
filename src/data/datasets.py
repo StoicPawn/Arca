@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Literal, Mapping, Optional, Tuple, Union
@@ -107,6 +108,53 @@ def _find_archive(base_path: Path, patterns: List[str]) -> Optional[Path]:
     return None
 
 
+def _verify_downloaded_dataset(
+    dataset_name: str,
+    dataset_obj,
+    paths: DatasetPaths,
+    checksum_spec: Union[str, Mapping[str, str], None],
+    archive_patterns: List[str],
+) -> None:
+    """Verify dataset checksum with graceful fallback to internal integrity checks.
+
+    Some torchvision/torchaudio datasets remove the original archive after
+    extraction, which means we cannot always recompute the user-specified
+    checksum. When this happens we fall back to the dataset's internal
+    ``_check_integrity`` method (when available). If that check succeeds we keep
+    the dataset while emitting a warning to make users aware of the mismatch.
+    """
+
+    digest, algorithm = _normalize_checksum_spec(checksum_spec)
+    if not digest:
+        return
+
+    archive = _find_archive(paths.raw, archive_patterns)
+    if archive is not None and verify_checksum_file(archive, digest, algorithm):
+        return
+
+    integrity_fn = getattr(dataset_obj, "_check_integrity", None)
+    if callable(integrity_fn):
+        try:
+            if integrity_fn():
+                warnings.warn(
+                    (
+                        f"Checksum verification failed for {dataset_name} archive, "
+                        "but the dataset passed its internal integrity check. "
+                        "Please update the configured checksum if the archive "
+                        "was legitimately refreshed."
+                    ),
+                    RuntimeWarning,
+                )
+                return
+        except Exception as exc:  # pragma: no cover - defensive
+            warnings.warn(
+                f"Failed to run internal integrity check for {dataset_name}: {exc}",
+                RuntimeWarning,
+            )
+
+    raise RuntimeError(f"Checksum verification failed for {dataset_name} dataset.")
+
+
 # ---------------------------------------------------------------------------
 # Vision preprocessing
 # ---------------------------------------------------------------------------
@@ -124,11 +172,9 @@ def _prepare_stl10(
     # STL10 ships with 96x96x3 numpy arrays
     images = torch.from_numpy(dataset.data).permute(0, 3, 1, 2).float() / 255.0
 
-    digest, algorithm = _normalize_checksum_spec(checksum_spec)
-    if digest:
-        archive = _find_archive(paths.raw, ["stl10*tar.gz", "stl10*zip"])
-        if archive is None or not verify_checksum_file(archive, digest, algorithm):
-            raise RuntimeError("Checksum verification failed for STL10 dataset.")
+    _verify_downloaded_dataset(
+        "STL10", dataset, paths, checksum_spec, ["stl10*tar.gz", "stl10*zip"]
+    )
 
     return {"features": images}
 
@@ -137,11 +183,9 @@ def _prepare_dtd(
     paths: DatasetPaths, checksum_spec: Union[str, Mapping[str, str], None]
 ) -> Dict[str, torch.Tensor]:
     dataset = tv_datasets.DTD(root=str(paths.raw), split="train", download=True)
-    digest, algorithm = _normalize_checksum_spec(checksum_spec)
-    if digest:
-        archive = _find_archive(paths.raw, ["dtd*tar.gz", "dtd*zip"])
-        if archive is None or not verify_checksum_file(archive, digest, algorithm):
-            raise RuntimeError("Checksum verification failed for DTD dataset.")
+    _verify_downloaded_dataset(
+        "DTD", dataset, paths, checksum_spec, ["dtd*tar.gz", "dtd*zip"]
+    )
 
     resize = T.Resize((96, 96))
     to_tensor = T.ToTensor()
@@ -194,11 +238,13 @@ def _prepare_urbansound8k(
         root=str(paths.raw),
         download=True,
     )
-    digest, algorithm = _normalize_checksum_spec(checksum_spec)
-    if digest:
-        archive = _find_archive(paths.raw, ["UrbanSound8K*tar.gz", "UrbanSound8K*zip"])
-        if archive is None or not verify_checksum_file(archive, digest, algorithm):
-            raise RuntimeError("Checksum verification failed for UrbanSound8K dataset.")
+    _verify_downloaded_dataset(
+        "UrbanSound8K",
+        dataset,
+        paths,
+        checksum_spec,
+        ["UrbanSound8K*tar.gz", "UrbanSound8K*zip"],
+    )
 
     specs: List[torch.Tensor] = []
     lengths: List[int] = []
@@ -222,11 +268,9 @@ def _prepare_esc50(
     paths: DatasetPaths, checksum_spec: Union[str, Mapping[str, str], None]
 ) -> Dict[str, torch.Tensor]:
     dataset = torchaudio.datasets.ESC50(root=str(paths.raw), download=True)
-    digest, algorithm = _normalize_checksum_spec(checksum_spec)
-    if digest:
-        archive = _find_archive(paths.raw, ["ESC*zip", "ESC*tar.gz"])
-        if archive is None or not verify_checksum_file(archive, digest, algorithm):
-            raise RuntimeError("Checksum verification failed for ESC-50 dataset.")
+    _verify_downloaded_dataset(
+        "ESC-50", dataset, paths, checksum_spec, ["ESC*zip", "ESC*tar.gz"]
+    )
 
     specs: List[torch.Tensor] = []
     lengths: List[int] = []
