@@ -9,6 +9,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import torchvision
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm import tqdm
@@ -163,8 +164,20 @@ def _split_indices(num_samples: int, seed: int) -> Tuple[np.ndarray, np.ndarray]
     return train_idx, val_idx
 
 
-def _save_npz(path: pathlib.Path, data: np.ndarray, stats: Dict[str, np.ndarray]) -> None:
-    np.savez_compressed(path, data=data, **{k: v.astype(np.float32) for k, v in stats.items()})
+def _save_npz(
+    path: pathlib.Path,
+    data: np.ndarray,
+    stats: Dict[str, np.ndarray],
+    mask: np.ndarray | None = None,
+    lengths: np.ndarray | None = None,
+) -> None:
+    arrays: Dict[str, np.ndarray] = {"data": data}
+    if mask is not None:
+        arrays["mask"] = mask
+    if lengths is not None:
+        arrays["lengths"] = lengths
+    arrays.update({k: v.astype(np.float32) for k, v in stats.items()})
+    np.savez_compressed(path, **arrays)
 
 
 def _save_stats(path: pathlib.Path, stats: Dict[str, np.ndarray]) -> None:
@@ -288,7 +301,8 @@ def process_audio_dataset(
             f"Failed to download {name}. Check your network connection or manually place the files in {dataset_dir}."
         ) from exc
 
-    features: List[np.ndarray] = []
+    features: List[torch.Tensor] = []
+    lengths: List[int] = []
     for idx in tqdm(range(len(dataset)), desc=f"Processing {name}"):
         try:
             waveform, sample_rate, *_ = dataset[idx]
@@ -297,26 +311,53 @@ def process_audio_dataset(
         waveform = _to_mono(waveform)
         waveform = _resample_waveform(waveform, sample_rate)
         audio = waveform.numpy()
-        features.append(_compute_log_mel(audio))
+        log_mel = _compute_log_mel(audio)
+        mel_tensor = torch.from_numpy(log_mel.T)  # (time, n_mels)
+        features.append(mel_tensor)
+        lengths.append(int(mel_tensor.shape[0]))
         if limit is not None and len(features) >= limit:
             break
 
-    data = np.stack(features)
-    mean = data.mean(axis=(0, 2))
-    std = data.std(axis=(0, 2)) + 1e-6
+    if not features:
+        raise RuntimeError(f"No audio features were extracted from dataset '{name}'")
+
+    padded = pad_sequence(features, batch_first=True)  # (batch, time, n_mels)
+    lengths_tensor = torch.tensor(lengths, dtype=torch.int64)
+    max_length = int(lengths_tensor.max().item())
+    time_indices = torch.arange(max_length, dtype=torch.int64)
+    mask = time_indices.unsqueeze(0) < lengths_tensor.unsqueeze(1)
+
+    valid = mask.unsqueeze(-1).to(padded.dtype)
+    weighted = padded * valid
+    sum_mel = weighted.sum(dim=(0, 1))
+    sum_sq_mel = (padded.pow(2) * valid).sum(dim=(0, 1))
+    total_weight = valid.sum().clamp(min=1.0)
+    mean = sum_mel / total_weight
+    var = (sum_sq_mel / total_weight) - mean.pow(2)
+    std = torch.sqrt(torch.clamp(var, min=1e-6))
+
+    data = padded.transpose(1, 2).numpy()  # (batch, n_mels, max_time)
+    mask_np = mask.numpy()
+    lengths_np = lengths_tensor.numpy()
+    mean_np = mean.numpy()
+    std_np = std.numpy()
 
     train_idx, val_idx = _split_indices(len(data), seed)
     train_data = data[train_idx]
     val_data = data[val_idx]
+    train_mask = mask_np[train_idx]
+    val_mask = mask_np[val_idx]
+    train_lengths = lengths_np[train_idx]
+    val_lengths = lengths_np[val_idx]
 
-    stats = {"mean": mean, "std": std}
+    stats = {"mean": mean_np, "std": std_np}
 
     train_path = processed_dir / f"audio_{name.lower()}_train.npz"
     val_path = processed_dir / f"audio_{name.lower()}_val.npz"
     stats_path = processed_dir / f"audio_{name.lower()}_stats.json"
 
-    _save_npz(train_path, train_data, stats)
-    _save_npz(val_path, val_data, stats)
+    _save_npz(train_path, train_data, stats, mask=train_mask, lengths=train_lengths)
+    _save_npz(val_path, val_data, stats, mask=val_mask, lengths=val_lengths)
     _save_stats(stats_path, stats)
 
     LOGGER.info("Saved audio dataset '%s' to %s", name, processed_dir)
