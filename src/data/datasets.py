@@ -497,9 +497,16 @@ def _prepare_hf_audio_dataset(
     split = dataset_cfg.get("split", "train")
     revision = dataset_cfg.get("revision")
     if not revision:
-        raise ValueError(
-            f"Hugging Face dataset configuration for {dataset_name} must include a 'revision'."
+        warnings.warn(
+            (
+                "No Hugging Face dataset revision specified for "
+                f"{dataset_name}; defaulting to the latest revision. This may affect "
+                "reproducibility."
+            ),
+            RuntimeWarning,
+            stacklevel=2,
         )
+        revision = None
     cache_subdir = dataset_cfg.get("cache_subdir")
     audio_column = dataset_cfg.get("audio_column", "audio")
     label_column = dataset_cfg.get("label_column")
