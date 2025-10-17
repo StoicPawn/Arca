@@ -107,11 +107,11 @@ class AssociativeTrainer:
 
         embedding_dim = int(model_cfg.get("d", 512))
         self.vision_model = VisionAdapter(
-            VisionAdapterConfig(embedding_dim=embedding_dim)
+            VisionAdapterConfig(slot_dim=embedding_dim)
         ).to(self.device)
         n_mels = int(self.dataset.audio.size(2))
         self.audio_model = AudioAdapter(
-            AudioAdapterConfig(embedding_dim=embedding_dim, n_mels=n_mels)
+            AudioAdapterConfig(slot_dim=embedding_dim, n_mels=n_mels)
         ).to(self.device)
 
         params = list(self.vision_model.parameters()) + list(self.audio_model.parameters())
@@ -220,7 +220,7 @@ class AssociativeTrainer:
         mask_flat = mask.view(batch * num_objects)
         embeddings = torch.zeros(
             batch * num_objects,
-            self.vision_model.config.embedding_dim,
+            self.vision_model.config.slot_dim,
             device=self.device,
         )
         if mask_flat.any():
@@ -238,7 +238,7 @@ class AssociativeTrainer:
 
         embeddings = torch.zeros(
             batch * num_events,
-            self.audio_model.config.embedding_dim,
+            self.audio_model.config.slot_dim,
             device=self.device,
         )
         if event_mask_flat.any():
