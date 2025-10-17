@@ -47,6 +47,8 @@ class VisionAdapterConfig:
     grid_size: int = 4
     slot_dim: int = 48
     use_group_norm: bool = True
+    aggregator: str = "mlp"
+    aggregator_hidden_dim: int | None = None
 
 
 class VisionAdapter(nn.Module):
@@ -85,7 +87,20 @@ class VisionAdapter(nn.Module):
         self.slot_projection = nn.Linear(in_channels, config.slot_dim)
         self.output_norm = nn.LayerNorm(config.slot_dim)
 
-    def forward(self, images: Tensor) -> Tensor:
+        num_slots = config.grid_size * config.grid_size
+        if config.aggregator == "mlp":
+            hidden = config.aggregator_hidden_dim or (num_slots * config.slot_dim)
+            self.slot_mixer = nn.Sequential(
+                nn.LayerNorm(num_slots * config.slot_dim),
+                nn.Linear(num_slots * config.slot_dim, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, config.slot_dim),
+            )
+        else:
+            self.slot_mixer = None
+        self.final_norm = nn.LayerNorm(config.slot_dim)
+
+    def forward(self, images: Tensor, *, return_grid: bool = False) -> Tensor:
         if images.dim() != 4:
             raise ValueError("images must have shape (batch, channels, height, width)")
 
@@ -95,7 +110,26 @@ class VisionAdapter(nn.Module):
         slots = grid.view(batch_size, channels, height * width).transpose(1, 2)
         slots = self.slot_norm(slots)
         projected = self.slot_projection(slots)
-        return self.output_norm(projected)
+        slots = self.output_norm(projected)
+        if return_grid:
+            return slots
+        aggregated = self._aggregate_slots(slots)
+        return self.final_norm(aggregated)
+
+    def _aggregate_slots(self, slots: Tensor) -> Tensor:
+        if slots.dim() != 3:
+            raise ValueError("slots must have shape (batch, num_slots, slot_dim)")
+
+        if self.config.aggregator == "mlp":
+            if self.slot_mixer is None:
+                raise RuntimeError("slot_mixer is not initialised for MLP aggregation")
+            flattened = slots.reshape(slots.size(0), -1)
+            return self.slot_mixer(flattened)
+        if self.config.aggregator == "mean":
+            return slots.mean(dim=1)
+        if self.config.aggregator == "max":
+            return slots.max(dim=1).values
+        raise ValueError(f"Unknown aggregator '{self.config.aggregator}'")
 
 
 __all__ = ["VisionAdapter", "VisionAdapterConfig"]
