@@ -113,3 +113,23 @@ composizionali mantenendo il determinismo (seed globale).
 Questo modulo rappresenta la base sensoriale per step successivi del progetto Arca,
 in cui verrà introdotto un backbone multimodale più ampio.
 
+
+## Esportare l'intero progetto
+
+Per creare rapidamente un archivio ZIP contenente l'intera repository (inclusi README e
+configurazioni) è disponibile uno script dedicato:
+
+```bash
+python scripts/export_project.py
+```
+
+Il comando genera un file `zip` all'interno della cartella `exports/` con un timestamp nel
+nome. Per salvare l'archivio in un percorso personalizzato è possibile usare l'opzione
+`--output`:
+
+```bash
+python scripts/export_project.py --output /percorso/destinazione/arca.zip
+```
+
+Le cartelle temporanee come `.git`, `exports/` e `__pycache__/` sono escluse
+automaticamente dall'archivio.
