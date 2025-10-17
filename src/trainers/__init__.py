@@ -1,5 +1,5 @@
-"""Training utilities for self-supervised adapters."""
+"""Training utilities for associative adapters."""
 
-from .ssl import SSLTrainer, run
+from .ssl import AssociativeTrainer, run
 
-__all__ = ["SSLTrainer", "run"]
+__all__ = ["AssociativeTrainer", "run"]
