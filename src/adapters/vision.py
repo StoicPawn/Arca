@@ -1,12 +1,11 @@
-"""Vision adapter composed of lightweight convolutional blocks."""
+"""Vision adapter that produces object-centric slots on a fixed spatial grid."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
-import torch
 from torch import Tensor, nn
-import torch.nn.functional as F
 
 
 class LayerNorm2d(nn.Module):
@@ -18,11 +17,25 @@ class LayerNorm2d(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         if x.dim() != 4:
-            raise ValueError("LayerNorm2d expects input with shape (batch, channels, height, width)")
+            raise ValueError(
+                "LayerNorm2d expects input with shape (batch, channels, height, width)"
+            )
         batch, channels, height, width = x.shape
         reshaped = x.permute(0, 2, 3, 1).reshape(-1, channels)
         normalised = self.norm(reshaped)
         return normalised.reshape(batch, height, width, channels).permute(0, 3, 1, 2)
+
+
+def _make_group_norm(num_channels: int) -> nn.GroupNorm:
+    """Return a lightweight GroupNorm with a reasonable number of groups."""
+
+    if num_channels < 8:
+        return nn.GroupNorm(1, num_channels)
+    # Use powers of two when possible to keep the groups balanced.
+    for groups in (8, 4, 2):
+        if num_channels % groups == 0:
+            return nn.GroupNorm(groups, num_channels)
+    return nn.GroupNorm(1, num_channels)
 
 
 @dataclass
@@ -30,12 +43,14 @@ class VisionAdapterConfig:
     """Configuration for :class:`VisionAdapter`."""
 
     in_channels: int = 3
-    hidden_dims: tuple[int, int] = (64, 128)
-    embedding_dim: int = 512
+    hidden_dims: Sequence[int] = (48, 96, 128)
+    grid_size: int = 4
+    slot_dim: int = 48
+    use_group_norm: bool = True
 
 
 class VisionAdapter(nn.Module):
-    """Simple convolutional encoder returning L2-normalised embeddings."""
+    """Shallow CNN that maps images to a grid of object-centric slots."""
 
     def __init__(self, config: VisionAdapterConfig | None = None) -> None:
         super().__init__()
@@ -46,28 +61,41 @@ class VisionAdapter(nn.Module):
 
         layers: list[nn.Module] = []
         in_channels = config.in_channels
-        for idx, hidden in enumerate(config.hidden_dims):
-            stride = 1 if idx == 0 else 2
-            layers.append(nn.Conv2d(in_channels, hidden, kernel_size=3, stride=stride, padding=1))
+        for hidden in config.hidden_dims:
+            layers.append(
+                nn.Conv2d(
+                    in_channels,
+                    hidden,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    bias=False,
+                )
+            )
+            if config.use_group_norm:
+                layers.append(_make_group_norm(hidden))
+            else:
+                layers.append(LayerNorm2d(hidden))
             layers.append(nn.GELU())
-            layers.append(LayerNorm2d(hidden))
             in_channels = hidden
 
-        self.feature_extractor = nn.Sequential(*layers)
-        self.projection = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(in_channels, config.embedding_dim),
-            nn.LayerNorm(config.embedding_dim),
-        )
+        self.backbone = nn.Sequential(*layers)
+        self.grid_pool = nn.AdaptiveAvgPool2d((config.grid_size, config.grid_size))
+        self.slot_norm = nn.LayerNorm(in_channels)
+        self.slot_projection = nn.Linear(in_channels, config.slot_dim)
+        self.output_norm = nn.LayerNorm(config.slot_dim)
 
     def forward(self, images: Tensor) -> Tensor:
         if images.dim() != 4:
             raise ValueError("images must have shape (batch, channels, height, width)")
 
-        features = self.feature_extractor(images)
-        embedding = self.projection(features)
-        return F.normalize(embedding, dim=-1)
+        features = self.backbone(images)
+        grid = self.grid_pool(features)
+        batch_size, channels, height, width = grid.shape
+        slots = grid.view(batch_size, channels, height * width).transpose(1, 2)
+        slots = self.slot_norm(slots)
+        projected = self.slot_projection(slots)
+        return self.output_norm(projected)
 
 
 __all__ = ["VisionAdapter", "VisionAdapterConfig"]
