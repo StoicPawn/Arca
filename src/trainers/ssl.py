@@ -244,7 +244,22 @@ class AssociativeTrainer:
         if event_mask_flat.any():
             valid = flattened[event_mask_flat]
             valid_mask = mask_flat[event_mask_flat]
-            encoded = self.audio_model(valid, valid_mask)
+            encoded, slot_mask = self.audio_model(
+                valid, valid_mask, return_mask=True
+            )
+
+            if slot_mask is not None:
+                weights = slot_mask.to(encoded.dtype).unsqueeze(-1)
+                summed = (encoded * weights).sum(dim=1)
+                denom = weights.sum(dim=1)
+                encoded = torch.where(
+                    denom > 0,
+                    summed / denom.clamp_min(1e-6),
+                    torch.zeros_like(summed),
+                )
+            else:
+                encoded = encoded.mean(dim=1)
+
             embeddings[event_mask_flat] = encoded
         return embeddings.view(batch, num_events, -1)
 
