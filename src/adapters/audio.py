@@ -47,6 +47,15 @@ class TemporalWindowing(nn.Module):
             raise ValueError("features must have shape (batch, channels, time)")
 
         batch, channels, time = features.shape
+        if mask is not None:
+            if mask.dim() != 2:
+                raise ValueError("mask must have shape (batch, time)")
+            mask = mask.to(features.dtype)
+            if mask.size(1) != time:
+                # Downsample or upsample the mask to match the feature sequence length.
+                mask = F.interpolate(
+                    mask.unsqueeze(1), size=time, mode="nearest"
+                ).squeeze(1)
         if time < self.window_size:
             padding = self.window_size - time
             features = F.pad(features, (0, padding))
@@ -60,9 +69,6 @@ class TemporalWindowing(nn.Module):
 
         window_mask: Tensor | None = None
         if mask is not None:
-            if mask.dim() != 2:
-                raise ValueError("mask must have shape (batch, time)")
-            mask = mask.to(features.dtype)
             if mask.size(1) < self.window_size:
                 padding = self.window_size - mask.size(1)
                 mask = F.pad(mask, (0, padding))
