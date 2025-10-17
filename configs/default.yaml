@@ -5,36 +5,44 @@ modalities:
 data:
   root: ./data
   datasets:
-    vision:
-      name: CIFAR10
+    cooccurrence:
+      name: synthetic_cooccurrence
       options:
-        train: true
-        limit: 2048
-    audio:
-      name: YESNO
-      options:
-        limit: 128
-  batch_size:
-    vision: 256
-    audio: 128
+        train_clips: 320
+        val_clips: 80
+        test_clips: 80
+        holdout_pairs:
+          - [triangle, red]
+          - [square, blue]
+        clip_length: [1.5, 3.0]
+        jitter:
+          color: 0.05
+          pitch: 0.02
+          loudness: 0.05
+          position: 0.06
+          scale: 0.04
+        max_objects: 3
+        max_events: 3
+  batch_size: 32
   num_workers: 4
 model:
   d: 512
-  trainer: vicreg
-  epochs: 100
-  lr: 0.001
-  weight_decay: 0.05
-  temperature: 0.1
+  trainer: cooccurrence
+  epochs: 150
+  lr: 0.0005
+  weight_decay: 0.02
+  kernel_scales: [0.12, 0.35, 0.7]
+  variance_floor: 0.05
   augment:
     vision:
-      crop: 0.8
-      flip: true
-      color_jitter: 0.2
-      blur: 0.3
+      crop: 0.9
+      flip: false
+      color_jitter: 0.05
+      blur: 0.0
     audio:
-      time_shift: 0.2
-      mask_time: 0.1
-      noise: 0.01
+      time_shift: 0.0
+      mask_time: 0.0
+      noise: 0.0
 eval:
   every_n_epochs: 10
   metrics:
